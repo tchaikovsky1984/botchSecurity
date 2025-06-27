@@ -2,3 +2,4 @@ dataset/
 dataset.zip
 backend/venv/
 backend/app/__pycache__/
+backend/app/*.pth
