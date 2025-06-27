@@ -13,6 +13,7 @@ from collections import defaultdict
 import random  # Not directly used in FastAPI inference, but kept for consistency if parts are reused
 
 # FastAPI imports
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import shutil  # For saving uploaded files temporarily
@@ -253,6 +254,20 @@ model = None
 person_idx_to_name = None
 not_identified_idx = None
 
+origins = [
+    "http://localhost",
+    "http://localhost:5173",  # Your frontend's development URL
+    "http://127.0.0.1:5173",  # Another common local development URL for frontend
+    # You might want to add other specific URLs if you deploy your frontend elsewhere
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,       # List of allowed origins
+    allow_credentials=True,      # Allow cookies to be included in cross-origin requests
+    allow_methods=["*"],         # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],         # Allow all headers
+)
 
 @app.on_event("startup")
 async def load_model_and_mappings():
