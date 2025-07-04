@@ -16,11 +16,14 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 
 # --- Configuration ---
 # These MUST match the values used during your model training!
-DATA_ROOT = './dataset/'  # Adjust this path as necessary for your deployment
+DATA_ROOT = '../../dataset/'  # Adjust this path as necessary for your deployment
+print("before model path")
 MODEL_PATH = '../../weights/multimodal_person_model.pth' # Path to your saved .pth model
+print("after model path")
 AUDIO_MAX_LEN = 500
 AUDIO_N_MFCC = 40
 AUDIO_SAMPLE_RATE_FOR_PREPROCESS = 16000
@@ -230,36 +233,8 @@ def preprocess_single_audio(aud_file_path, sample_rate=AUDIO_SAMPLE_RATE_FOR_PRE
         return torch.zeros(1, max_len, n_mfcc)  # Return dummy tensor on error
 
 
-# --- FastAPI App Initialization ---
-app = FastAPI(
-    title="Multi-Modal Person Identification API (SIFT + MFCC ANN)",
-    description="API for identifying persons using SIFT features from images and MFCCs from audio.",
-    version="1.0.0"
-)
-
-# Global variables to store model and dataset info
-model = None
-person_idx_to_name = None
-not_identified_idx = None
-sift_input_dim = None
-mfcc_input_dim = None
-
-origins = [
-    "http://localhost",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-async def load_model_and_mappings():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """
     Loads the trained model and dataset mappings when the FastAPI application starts.
     """
@@ -299,6 +274,41 @@ async def load_model_and_mappings():
     except Exception as e:
         print(f"ERROR: Could not load model from '{MODEL_PATH}': {e}")
         raise HTTPException(status_code=500, detail=f"Server startup error: Could not load model: {e}")
+    
+    yield
+    
+    # Clean up resources if needed on shutdown
+    print("FastAPI shutdown: Cleaning up resources.")
+
+
+# --- FastAPI App Initialization ---
+app = FastAPI(
+    title="Multi-Modal Person Identification API (SIFT + MFCC ANN)",
+    description="API for identifying persons using SIFT features from images and MFCCs from audio.",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Global variables to store model and dataset info
+model = None
+person_idx_to_name = None
+not_identified_idx = None
+sift_input_dim = None
+mfcc_input_dim = None
+
+origins = [
+    "http://localhost",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 async def read_root():
