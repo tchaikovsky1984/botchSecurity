@@ -2,59 +2,79 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms, models
-from PIL import Image
-import torchaudio
-import torchaudio.transforms as T
 import numpy as np
 import time
 import glob
-from collections import defaultdict
-import random  # Not directly used in FastAPI inference, but kept for consistency if parts are reused
+import cv2  # Import OpenCV for SIFT
+from PIL import Image
+import torchaudio
+import torchaudio.transforms as T
 
 # FastAPI imports
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-import shutil  # For saving uploaded files temporarily
-import tempfile  # For creating temporary files/directories
+import shutil
+import tempfile
 
 # --- Configuration ---
 # These MUST match the values used during your model training!
-DATA_ROOT = '../../dataset/'
-MODEL_SAVE_DIR = './'  # Directory where models are saved
+DATA_ROOT = './dataset/'  # Adjust this path as necessary for your deployment
+MODEL_SAVE_DIR = './'     # Directory where your .pth model is saved
 AUDIO_MAX_LEN = 500
 AUDIO_N_MFCC = 40
 AUDIO_SAMPLE_RATE_FOR_PREPROCESS = 16000
+MAX_SIFT_DESCRIPTORS = 100 # From your MultiModalPersonDataset
+SIFT_DESCRIPTOR_DIM = 128 # Default for SIFT
 
-# Prediction thresholds (can be adjusted for desired sensitivity)
-# For AttentionFusionModel, these apply to the single fused output's confidence.
-# Confidence threshold for classification (e.g., if confidence < 0.7, label as "not identified")
+# Prediction thresholds
 THRESHOLD_FUSED = 0.7
 
 # Device setup
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"FastAPI app will use device: {DEVICE}")
+
+# --- SIFT Feature Extraction Function (from your ipynb) ---
+def get_sift_features(image_path):
+    """
+    Extracts SIFT feature vectors from an image.
+    Args:
+        image_path (str): The path to the image file.
+    Returns:
+        tuple: A tuple containing:
+            - keypoints (list): A list of cv2.KeyPoint objects.
+            - descriptors (numpy.ndarray): A NumPy array of SIFT descriptors,
+                                         or None if no features are found.
+    """
+    sift = cv2.SIFT_create()
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+
+    if img is None:
+        print(f"Error: Could not load image from {image_path}")
+        return [], None
+
+    keypoints, descriptors = sift.detectAndCompute(img, None)
+    return keypoints, descriptors
 
 # --- 1. MultiModalPersonDataset Class (Minimal for mappings) ---
 # This class needs to be identical in terms of person-to-index mapping
 # and `not_identified_label` to the one used during training.
 # Data loading methods are stubbed out as they're not needed for inference mapping.
-
-
-class MultiModalPersonDataset:  # Changed from Dataset to a regular class as it's not iterated
-    def __init__(self, root_dir):
+class MultiModalPersonDataset:
+    def __init__(self, root_dir, audio_sample_rate=16000, audio_n_mfcc=40, audio_max_len=500, is_train=True, use_sift=False, max_sift_descriptors=100):
         self.root_dir = root_dir
+        self.audio_sample_rate = audio_sample_rate
+        self.audio_n_mfcc = audio_n_mfcc
+        self.audio_max_len = audio_max_len
+        self.is_train = is_train
+        self.use_sift = use_sift
+        self.max_sift_descriptors = max_sift_descriptors
+        self.sift_descriptor_dim = 128 # Default for SIFT
 
-        # Original persons collected from directory names
-        self.persons = sorted([d for d in os.listdir(
-            root_dir) if os.path.isdir(os.path.join(root_dir, d))])
-        self.person_to_idx = {person: idx for idx,
-                              person in enumerate(self.persons)}
-        self.idx_to_person = {idx: person for idx,
-                              person in enumerate(self.persons)}
+        self.persons = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
+        self.person_to_idx = {person: idx for idx, person in enumerate(self.persons)}
+        self.idx_to_person = {idx: person for person, idx in self.person_to_idx.items()}
 
-        # Add the 'not identified' class exactly as in your training code
         self.not_identified_label = len(self.persons)
         self.person_to_idx['not identified'] = self.not_identified_label
         self.idx_to_person[self.not_identified_label] = 'not identified'
@@ -64,165 +84,132 @@ class MultiModalPersonDataset:  # Changed from Dataset to a regular class as it'
     def _collect_paths(self): pass
     def _create_data_pairs_with_mismatched(self): return []
     def __len__(self): return 0
-    def __getitem__(self, idx): raise NotImplementedError(
-        "Not a dataset for data loading.")
+    def __getitem__(self, idx): raise NotImplementedError("Not a dataset for data loading.")
 
-# --- 2. Model Architecture Classes (Identical to your ipynb) ---
+# --- 2. ANNModel Architecture (Identical to your ipynb) ---
+class ANNModel(nn.Module):
+    def __init__(self, num_classes, sift_input_dim, mfcc_input_dim):
+        super(ANNModel, self).__init__()
 
+        # Define the SIFT branch (simple ANNs)
+        self.sift_fc1 = nn.Linear(sift_input_dim, 512)
+        self.sift_fc2 = nn.Linear(512, 256)
 
-class ImageCNN_Complex(nn.Module):
-    def __init__(self, embedding_dim=512):
-        super(ImageCNN_Complex, self).__init__()
-        # Ensure this matches your trained model
-        self.backbone = models.resnet50(weights=None)
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-        num_ftrs = self.backbone.fc.in_features
-        self.backbone.fc = nn.Linear(num_ftrs, embedding_dim)
+        # Define the MFCC branch (simple ANNs)
+        self.mfcc_fc1 = nn.Linear(mfcc_input_dim, 512)
+        self.mfcc_fc2 = nn.Linear(512, 256)
 
-    def forward(self, x):
-        return self.backbone(x)
+        # Define the combined branch
+        combined_input_dim = 256 + 256
+        self.combined_fc1 = nn.Linear(combined_input_dim, 128)
+        self.combined_fc2 = nn.Linear(128, num_classes)
 
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
 
-class AudioRNN_Complex(nn.Module):
-    # Match training params
-    def __init__(self, input_dim, hidden_dim=256, num_layers=2, embedding_dim=512):
-        super(AudioRNN_Complex, self).__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, num_layers,
-                          batch_first=True, bidirectional=True)
-        self.fc = nn.Linear(hidden_dim * 2, embedding_dim)
+    def forward(self, sift_features, mfcc_features):
+        # Process SIFT features
+        sift_out = self.sift_fc1(sift_features)
+        sift_out = self.relu(sift_out)
+        sift_out = self.dropout(sift_out)
+        sift_out = self.sift_fc2(sift_out)
+        sift_out = self.relu(sift_out)
+        sift_out = self.dropout(sift_out)
 
-    def forward(self, x):
-        gru_out, hidden = self.gru(x)
-        hidden = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
-        embedding = self.fc(hidden)
-        return embedding
+        # Process MFCC features (flatten before passing through ANN)
+        mfcc_features_flat = mfcc_features.view(mfcc_features.size(0), -1) # Flatten time and n_mfcc dims
+        mfcc_out = self.mfcc_fc1(mfcc_features_flat)
+        mfcc_out = self.relu(mfcc_out)
+        mfcc_out = self.dropout(mfcc_out)
+        mfcc_out = self.mfcc_fc2(mfcc_out)
+        mfcc_out = self.relu(mfcc_out)
+        mfcc_out = self.dropout(mfcc_out)
 
+        # Concatenate outputs from both branches
+        combined_out = torch.cat((sift_out, mfcc_out), dim=1)
 
-class AttentionFusionModel(nn.Module):
-    def __init__(self, num_classes, image_embedding_dim=512, audio_embedding_dim=512, attention_dim=128):
-        super(AttentionFusionModel, self).__init__()
-        self.image_model = ImageCNN_Complex(embedding_dim=image_embedding_dim)
+        # Process combined features
+        combined_out = self.combined_fc1(combined_out)
+        combined_out = self.relu(combined_out)
+        combined_out = self.dropout(combined_out)
+        logits = self.combined_fc2(combined_out)
 
-        # Initialize audio model directly with fixed audio_n_mfcc from config
-        self.audio_model = AudioRNN_Complex(
-            input_dim=AUDIO_N_MFCC, embedding_dim=audio_embedding_dim)
+        return logits
 
-        self.image_embedding_dim = image_embedding_dim
-        self.audio_embedding_dim = audio_embedding_dim
-        self.attention_dim = attention_dim
-
-        self.attention_layer1 = nn.Linear(
-            self.image_embedding_dim + self.audio_embedding_dim, self.attention_dim)
-        # Output 2 scores: one for image, one for audio
-        self.attention_layer2 = nn.Linear(self.attention_dim, 2)
-
-        self.fusion_fc = nn.Linear(
-            self.image_embedding_dim + self.audio_embedding_dim, num_classes)
-
-    def forward(self, image_input, audio_input):
-        # Get embeddings from individual models
-        image_embedding = self.image_model(image_input)
-        audio_embedding = self.audio_model(audio_input)
-
-        # Concatenate original embeddings for attention
-        combined_original = torch.cat(
-            (image_embedding, audio_embedding), dim=1)
-
-        # Calculate attention weights
-        attention_scores = self.attention_layer2(
-            torch.tanh(self.attention_layer1(combined_original)))
-        attention_weights = F.softmax(attention_scores, dim=1)
-
-        # Split attention weights and apply
-        image_attn_weight = attention_weights[:, 0].unsqueeze(1)
-        audio_attn_weight = attention_weights[:, 1].unsqueeze(1)
-
-        image_attended = image_embedding * \
-            image_attn_weight.expand_as(image_embedding)
-        audio_attended = audio_embedding * \
-            audio_attn_weight.expand_as(audio_embedding)
-
-        # Concatenate attended embeddings
-        combined_attended_embedding = torch.cat(
-            (image_attended, audio_attended), dim=1)
-
-        # Pass through the final classification layer
-        output = self.fusion_fc(combined_attended_embedding)
-
-        return output
-
-# --- 3. Inference Function (Adapted for AttentionFusionModel's single output) ---
-
-
-def identify_person_multimodal_inference(model, image_tensor, audio_tensor, person_idx_to_name,
+# --- 3. Inference Function (Adapted for ANNModel's single output) ---
+def identify_person_multimodal_inference(model, sift_tensor, audio_tensor, person_idx_to_name,
                                          not_identified_idx, threshold_fused=0.7):
     model.eval()
     device = next(model.parameters()).device
-    image_tensor = image_tensor.to(device)
+    sift_tensor = sift_tensor.to(device)
     audio_tensor = audio_tensor.to(device)
 
     with torch.no_grad():
-        fused_logits = model(image_tensor, audio_tensor)
-        fused_probs = F.softmax(fused_logits, dim=1)  # Get probabilities
+        logits = model(sift_tensor, audio_tensor)
+        probs = F.softmax(logits, dim=1)
 
-        # Get the highest probability and its corresponding predicted index/name
-        conf_fused, pred_fused_idx = torch.max(fused_probs, dim=1)
-        conf_fused = conf_fused.item()  # Convert to scalar
-        pred_fused_idx = pred_fused_idx.item()  # Convert to scalar
+        conf, pred_idx = torch.max(probs, dim=1)
+        conf = conf.item()
+        pred_idx = pred_idx.item()
 
-        pred_fused_name = person_idx_to_name.get(pred_fused_idx, "Unknown_ID")
+        pred_name = person_idx_to_name.get(pred_idx, "Unknown_ID")
 
         details = {
-            "fused_confidence": f"{conf_fused:.4f}",
-            "predicted_label": pred_fused_name
+            "confidence": f"{conf:.4f}",
+            "predicted_label": pred_name
         }
 
-        # Decision logic based on the fused confidence and predicted label
-        if pred_fused_idx == not_identified_idx:
-            # If the model explicitly predicts "not identified"
-            if conf_fused >= threshold_fused:
+        if pred_idx == not_identified_idx:
+            if conf >= threshold_fused:
                 return "Not Identified", "Model confidently predicted 'Not Identified'", details
             else:
                 return "Not Identified", "Model predicted 'Not Identified' but with low confidence", details
         else:
-            # If the model predicts a specific person
-            if conf_fused >= threshold_fused:
-                return pred_fused_name, f"Model confidently identified {pred_fused_name}", details
+            if conf >= threshold_fused:
+                return pred_name, f"Model confidently identified {pred_name}", details
             else:
-                # If confidence for a specific person is low, fallback to "Not Identified"
-                return "Not Identified", f"Model predicted '{pred_fused_name}' but with low confidence", details
+                return "Not Identified", f"Model predicted '{pred_name}' but with low confidence", details
 
-# --- Helper functions for single input preprocessing (identical to previous) ---
+# --- Helper functions for single input preprocessing ---
+def preprocess_single_image_sift(img_file_path, max_descriptors=MAX_SIFT_DESCRIPTORS, descriptor_dim=SIFT_DESCRIPTOR_DIM):
+    """
+    Loads an image, extracts SIFT features, and formats them for the ANN model.
+    """
+    _, descriptors = get_sift_features(img_file_path)
 
+    if descriptors is not None:
+        num_descriptors = descriptors.shape[0]
+        fixed_size_descriptor_vector = torch.zeros(max_descriptors, descriptor_dim)
 
-def preprocess_single_image(img_file_path):
-    """Loads and preprocesses a single image for model input."""
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
-                             0.229, 0.224, 0.225])
-    ])
-    image = Image.open(img_file_path).convert('RGB')
-    return transform(image).unsqueeze(0)  # Add batch dimension
+        if num_descriptors > 0:
+            descriptors_tensor = torch.tensor(descriptors, dtype=torch.float32)
+            if num_descriptors > max_descriptors:
+                fixed_size_descriptor_vector = descriptors_tensor[:max_descriptors, :]
+            else:
+                fixed_size_descriptor_vector[:num_descriptors, :] = descriptors_tensor
+
+        image_input = fixed_size_descriptor_vector.flatten()
+    else:
+        # Handle case where no features are found (return zeros)
+        image_input = torch.zeros(max_descriptors * descriptor_dim)
+
+    return image_input.unsqueeze(0) # Add batch dimension
 
 
 def preprocess_single_audio(aud_file_path, sample_rate=AUDIO_SAMPLE_RATE_FOR_PREPROCESS, n_mfcc=AUDIO_N_MFCC, max_len=AUDIO_MAX_LEN):
     """Loads and preprocesses a single audio file for model input."""
     mfcc_transform = T.MFCC(sample_rate=sample_rate, n_mfcc=n_mfcc, melkwargs={
-                            "n_fft": 400, "hop_length": 160, "n_mels": 64})
+                                "n_fft": 400, "hop_length": 160, "n_mels": 64})
 
     try:
         waveform, sr = torchaudio.load(aud_file_path)
         if sr != sample_rate:
             resampler = T.Resample(sr, sample_rate)
             waveform = resampler(waveform)
-        if waveform.shape[0] > 1:  # Convert to mono if stereo
+        if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-        mfcc_features = mfcc_transform(waveform).squeeze(
-            0).transpose(0, 1)  # (n_mfcc, time) -> (time, n_mfcc)
+        mfcc_features = mfcc_transform(waveform).squeeze(0).transpose(0, 1)
 
         if mfcc_features.shape[0] > max_len:
             mfcc_features = mfcc_features[:max_len, :]
@@ -244,8 +231,8 @@ def preprocess_single_audio(aud_file_path, sample_rate=AUDIO_SAMPLE_RATE_FOR_PRE
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Multi-Modal Person Identification API",
-    description="API for identifying persons using image and audio inputs.",
+    title="Multi-Modal Person Identification API (SIFT + MFCC ANN)",
+    description="API for identifying persons using SIFT features from images and MFCCs from audio.",
     version="1.0.0"
 )
 
@@ -253,20 +240,21 @@ app = FastAPI(
 model = None
 person_idx_to_name = None
 not_identified_idx = None
+sift_input_dim = None
+mfcc_input_dim = None
 
 origins = [
     "http://localhost",
-    "http://localhost:5173",  # Your frontend's development URL
-    "http://127.0.0.1:5173",  # Another common local development URL for frontend
-    # You might want to add other specific URLs if you deploy your frontend elsewhere
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,       # List of allowed origins
-    allow_credentials=True,      # Allow cookies to be included in cross-origin requests
-    allow_methods=["*"],         # Allow all HTTP methods (GET, POST, PUT, DELETE, etc.)
-    allow_headers=["*"],         # Allow all headers
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.on_event("startup")
@@ -274,75 +262,68 @@ async def load_model_and_mappings():
     """
     Loads the trained model and dataset mappings when the FastAPI application starts.
     """
-    global model, person_idx_to_name, not_identified_idx
+    global model, person_idx_to_name, not_identified_idx, sift_input_dim, mfcc_input_dim
 
-    print("FastAPI startup: Loading dataset info for class mapping...")
+    print("FastAPI startup: Loading dataset info for class mapping and model dimensions...")
     try:
-        # Instantiate MultiModalPersonDataset to get mappings
-        # No is_train, audio_sample_rate etc. needed here
-        dataset_info = MultiModalPersonDataset(DATA_ROOT)
+        # Instantiate MultiModalPersonDataset to get mappings and dimensions
+        # Use the same parameters as during training to get correct dimensions
+        dataset_info = MultiModalPersonDataset(DATA_ROOT, use_sift=True, max_sift_descriptors=MAX_SIFT_DESCRIPTORS)
         num_classes = dataset_info.num_classes
         person_idx_to_name = dataset_info.idx_to_person
         not_identified_idx = dataset_info.not_identified_label
-        print(
-            f"Loaded class mappings for {num_classes} persons (including 'not identified').")
+        sift_input_dim = dataset_info.max_sift_descriptors * dataset_info.sift_descriptor_dim
+        mfcc_input_dim = dataset_info.audio_max_len * dataset_info.audio_n_mfcc
+
+        print(f"Loaded class mappings for {num_classes} persons (including 'not identified').")
+        print(f"Determined SIFT input dimension: {sift_input_dim}")
+        print(f"Determined MFCC input dimension: {mfcc_input_dim}")
     except Exception as e:
-        print(
-            f"ERROR: Could not load dataset info. Ensure DATA_ROOT ('{DATA_ROOT}') is correct and contains person directories.")
-        raise HTTPException(
-            status_code=500, detail=f"Server startup error: {e}")
+        print(f"ERROR: Could not load dataset info. Ensure DATA_ROOT ('{DATA_ROOT}') is correct and contains person directories.")
+        raise HTTPException(status_code=500, detail=f"Server startup error: {e}")
 
     print("FastAPI startup: Searching for the latest model...")
     list_of_files = glob.glob(os.path.join(MODEL_SAVE_DIR, '*.pth'))
     if not list_of_files:
-        print(
-            f"ERROR: No model files found in '{MODEL_SAVE_DIR}'. Please train the model and save it there.")
-        raise HTTPException(
-            status_code=500, detail="No trained model found. Please train the model.")
+        print(f"ERROR: No model files found in '{MODEL_SAVE_DIR}'. Please train the model and save it there.")
+        raise HTTPException(status_code=500, detail="No trained model found. Please train the model.")
 
     latest_model_path = max(list_of_files, key=os.path.getctime)
     print(f"FastAPI startup: Loading latest model from: {latest_model_path}")
 
     try:
-        # Initialize the model with the correct number of classes
-        model = AttentionFusionModel(num_classes=num_classes).to(DEVICE)
+        # Initialize the ANNModel with the determined input dimensions and number of classes
+        model = ANNModel(num_classes=num_classes, sift_input_dim=sift_input_dim, mfcc_input_dim=mfcc_input_dim).to(DEVICE)
 
         # Load the state_dict
-        model.load_state_dict(torch.load(
-            latest_model_path, map_location=DEVICE))
-        model.eval()  # Set model to evaluation mode
+        model.load_state_dict(torch.load(latest_model_path, map_location=DEVICE))
+        model.eval()
         print("FastAPI startup: Model loaded successfully.")
     except Exception as e:
         print(f"ERROR: Could not load model from '{latest_model_path}': {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Server startup error: Could not load model: {e}")
-
+        raise HTTPException(status_code=500, detail=f"Server startup error: Could not load model: {e}")
 
 @app.get("/")
 async def read_root():
     """
     Root endpoint for a simple health check.
     """
-    return {"message": "Multi-Modal Person Identification API is running. Go to /docs for API documentation."}
-
+    return {"message": "Multi-Modal Person Identification API (SIFT + MFCC ANN) is running. Go to /docs for API documentation."}
 
 @app.post("/predict/")
 async def predict_person(image_file: UploadFile = File(...), audio_file: UploadFile = File(...)):
     """
-    Predicts the identity of a person from an image and an audio file.
-
+    Predicts the identity of a person from an image (using SIFT) and an audio file (using MFCC).
     Args:
         image_file (UploadFile): The uploaded image file (JPEG, PNG).
         audio_file (UploadFile): The uploaded audio file (MP3, M4A, AAC).
-
     Returns:
         JSONResponse: A JSON object containing the identified person, reason, details, and prediction time.
     """
-    if model is None or person_idx_to_name is None or not_identified_idx is None:
+    if model is None or person_idx_to_name is None or not_identified_idx is None or sift_input_dim is None or mfcc_input_dim is None:
         raise HTTPException(
             status_code=503, detail="Model or mappings not loaded. Server is still starting up or encountered an error.")
 
-    # Create temporary files to save uploads
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(image_file.filename)[1]) as temp_img:
         shutil.copyfileobj(image_file.file, temp_img)
         temp_img_path = temp_img.name
@@ -352,34 +333,27 @@ async def predict_person(image_file: UploadFile = File(...), audio_file: UploadF
         temp_aud_path = temp_aud.name
 
     try:
-        # Preprocess inputs
         start_time = time.time()
-        image_tensor = preprocess_single_image(temp_img_path)
-        audio_tensor = preprocess_single_audio(
-            temp_aud_path, sample_rate=AUDIO_SAMPLE_RATE_FOR_PREPROCESS)
+        # Use the SIFT preprocessing function
+        image_sift_tensor = preprocess_single_image_sift(temp_img_path, MAX_SIFT_DESCRIPTORS, SIFT_DESCRIPTOR_DIM)
+        audio_mfcc_tensor = preprocess_single_audio(temp_aud_path, sample_rate=AUDIO_SAMPLE_RATE_FOR_PREPROCESS)
 
-        # Perform inference
-        identified, reason, details = identify_person_multimodal_inference(
-            model,
-            image_tensor,
-            audio_tensor,
-            person_idx_to_name,
-            not_identified_idx,
-            threshold_fused=THRESHOLD_FUSED
+        identified_person, reason, details = identify_person_multimodal_inference(
+            model, image_sift_tensor, audio_mfcc_tensor, person_idx_to_name,
+            not_identified_idx, THRESHOLD_FUSED
         )
         end_time = time.time()
         prediction_time = end_time - start_time
 
         return JSONResponse(content={
-            "identified_person": identified,
+            "identified_person": identified_person,
             "reason": reason,
-            "prediction_details": details,
+            "details": details,
             "prediction_time_seconds": f"{prediction_time:.4f}"
         })
 
     except Exception as e:
-        print(f"An error occurred during prediction: {e}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction error: {e}")
     finally:
         # Clean up temporary files
         os.unlink(temp_img_path)
