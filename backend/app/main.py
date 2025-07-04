@@ -20,7 +20,7 @@ import tempfile
 # --- Configuration ---
 # These MUST match the values used during your model training!
 DATA_ROOT = './dataset/'  # Adjust this path as necessary for your deployment
-MODEL_SAVE_DIR = './'     # Directory where your .pth model is saved
+MODEL_PATH = '../../weights/multimodal_person_model.pth' # Path to your saved .pth model
 AUDIO_MAX_LEN = 500
 AUDIO_N_MFCC = 40
 AUDIO_SAMPLE_RATE_FOR_PREPROCESS = 16000
@@ -106,6 +106,7 @@ class ANNModel(nn.Module):
 
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
+
 
     def forward(self, sift_features, mfcc_features):
         # Process SIFT features
@@ -282,25 +283,21 @@ async def load_model_and_mappings():
         print(f"ERROR: Could not load dataset info. Ensure DATA_ROOT ('{DATA_ROOT}') is correct and contains person directories.")
         raise HTTPException(status_code=500, detail=f"Server startup error: {e}")
 
-    print("FastAPI startup: Searching for the latest model...")
-    list_of_files = glob.glob(os.path.join(MODEL_SAVE_DIR, '*.pth'))
-    if not list_of_files:
-        print(f"ERROR: No model files found in '{MODEL_SAVE_DIR}'. Please train the model and save it there.")
-        raise HTTPException(status_code=500, detail="No trained model found. Please train the model.")
-
-    latest_model_path = max(list_of_files, key=os.path.getctime)
-    print(f"FastAPI startup: Loading latest model from: {latest_model_path}")
+    print(f"FastAPI startup: Loading model from: {MODEL_PATH}")
+    if not os.path.exists(MODEL_PATH):
+        print(f"ERROR: Model file not found at '{MODEL_PATH}'. Please ensure the file exists.")
+        raise HTTPException(status_code=500, detail="Model file not found.")
 
     try:
         # Initialize the ANNModel with the determined input dimensions and number of classes
         model = ANNModel(num_classes=num_classes, sift_input_dim=sift_input_dim, mfcc_input_dim=mfcc_input_dim).to(DEVICE)
 
         # Load the state_dict
-        model.load_state_dict(torch.load(latest_model_path, map_location=DEVICE))
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
         model.eval()
         print("FastAPI startup: Model loaded successfully.")
     except Exception as e:
-        print(f"ERROR: Could not load model from '{latest_model_path}': {e}")
+        print(f"ERROR: Could not load model from '{MODEL_PATH}': {e}")
         raise HTTPException(status_code=500, detail=f"Server startup error: Could not load model: {e}")
 
 @app.get("/")
